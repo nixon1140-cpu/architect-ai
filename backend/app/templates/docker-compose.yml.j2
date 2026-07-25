@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+{% for service in services %}
+  {{ service.name }}:
+{% if service.is_build %}
+    build:
+      context: {{ service.build_context }}
+{% else %}
+    image: {{ service.image }}
+{% endif %}
+    container_name: {{ service.container_name }}
+{% if service.env %}
+    environment:
+{% for key, value in service.env.items() %}
+      {{ key }}: {{ value }}
+{% endfor %}
+{% endif %}
+{% if service.ports %}
+    ports:
+{% for port in service.ports %}
+      - {{ port }}
+{% endfor %}
+{% endif %}
+{% endfor %}

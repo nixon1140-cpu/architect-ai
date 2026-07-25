@@ -1,0 +1,102 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------------------------------------------------------------------------
+   ArchitectAIのデザイントークン。
+   主題（システム設計）の道具立て＝製図面と計器盤から起こしている。
+   地は青黒の製図面、唯一のアクセントは注記に使う真鍮アンバー。
+   意味色（danger/ok）はアクセントとは別系統として扱い、混同させない。
+   計器盤という世界観に意図的に振るため、単一のダークテーマで構成する。
+
+   値はRGBチャンネル値で持つ。Tailwind側で rgb(var(--x) / <alpha-value>)
+   として解決させ、不透明度修飾子（bg-ok/10 等）が正しく効くようにするため。
+   --------------------------------------------------------------------------- */
+:root {
+  color-scheme: dark;
+
+  --ground: 10 14 20; /* #0a0e14 製図面の地 */
+  --panel: 17 24 35; /* #111823 パネル面 */
+  --well: 13 19 27; /* #0d131b 入力の窪み */
+  --rule: 31 42 56; /* #1f2a38 罫線 */
+  --rule-strong: 43 58 77; /* #2b3a4d 強い罫線 */
+  --text: 227 232 239; /* #e3e8ef 本文 */
+  --muted: 126 141 161; /* #7e8da1 補助（青みを含む中間色） */
+  --accent: 224 162 76; /* #e0a24c 注記の真鍮アンバー */
+  --accent-dim: 138 101 48; /* #8a6530 沈めたアクセント */
+  --danger: 224 107 96; /* #e06b60 異常（意味色） */
+  --ok: 105 181 140; /* #69b58c 正常（意味色） */
+
+  /* UI本文は日本語主体のため、日本語が正しく出る系統を先頭に置く。
+     Webフォントを外部取得しない＝Dockerビルド時のネットワーク依存も避ける。 */
+  --font-ui: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Noto Sans JP",
+    system-ui, -apple-system, "Segoe UI", sans-serif;
+  /* 等幅は「計器の文字盤」として、ID・状態名・時刻・JSON・英字ラベルに使う。 */
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo,
+    Consolas, monospace;
+}
+
+@layer base {
+  body {
+    background-color: rgb(var(--ground));
+    color: rgb(var(--text));
+    font-family: var(--font-ui);
+  }
+
+  /* 暗い地の上でキーボードフォーカスを見失わせない。 */
+  :focus-visible {
+    outline: 2px solid rgb(var(--accent));
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: rgb(var(--accent));
+    color: rgb(var(--ground));
+  }
+
+  /* スクロールバーも罫線の一部として、主張させずに整える。 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--rule-strong)) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--rule-strong));
+    border: 3px solid rgb(var(--ground));
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  /* 通知は視界の端に滑り込ませる程度に留める。 */
+  .toast-enter {
+    animation: toast-in 180ms ease-out;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
