@@ -1,0 +1,40 @@
+terraform {
+  required_providers {
+    docker = {
+      source  = "kreuzwerker/docker"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "docker" {}
+
+{% for service in services %}
+resource "docker_image" "{{ service.name }}" {
+  name = {{ service.image_ref }}
+{% if service.is_build %}
+  build {
+    context = {{ service.build_context }}
+  }
+{% endif %}
+}
+
+resource "docker_container" "{{ service.name }}" {
+  name  = {{ service.container_name }}
+  image = docker_image.{{ service.name }}.image_id
+{% if service.env_entries %}
+  env = [
+{% for entry in service.env_entries %}
+    {{ entry }},
+{% endfor %}
+  ]
+{% endif %}
+{% for port in service.ports %}
+  ports {
+    internal = {{ port.internal }}
+    external = {{ port.external }}
+  }
+{% endfor %}
+}
+
+{% endfor %}

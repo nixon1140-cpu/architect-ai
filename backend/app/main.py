@@ -67,7 +67,7 @@ from app.schemas import (
     strip_json_fence,
 )
 from app.services.ai_agents import build_claude_handoff_prompt, run_hearing_turn
-from app.services.iac_builder import build_iac_zip
+from app.services.iac_builder import IacFormat, build_iac_zip
 
 setup_logging()
 logger = get_logger(__name__)
@@ -777,14 +777,24 @@ async def edit_claude_json(
 @app.get("/api/v1/sessions/{session_id}/export")
 async def export(
     session_id: uuid.UUID,
+    output_format: IacFormat = "docker-compose",
     db: DBSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Response:
     """確定した構成のZIPダウンロードエンドポイント。ログイン中ユーザー自身の
-    プロジェクトに属するセッションのみダウンロードできる。"""
+    プロジェクトに属するセッションのみダウンロードできる。
+
+    output_format クエリパラメータで出力形式を選択できる
+    （"docker-compose"（既定）または "terraform"）。FastAPIがIacFormat
+    （Literal型）に無い値を自動的に422で拒否する。
+    """
     logger.info(
         "exportリクエストを受信しました",
-        extra={"session_id": str(session_id), "user_id": str(current_user.id)},
+        extra={
+            "session_id": str(session_id),
+            "user_id": str(current_user.id),
+            "output_format": output_format,
+        },
     )
 
     session = await run_in_threadpool(_get_session_sync, db, session_id, current_user.id)
@@ -807,10 +817,10 @@ async def export(
     submission_data = json.loads(latest_submission_message.content)
     submission = ClaudeJSONSubmission(**submission_data)
 
-    zip_bytes = build_iac_zip(submission)
+    zip_bytes = build_iac_zip(submission, output_format=output_format)
     logger.info(
         "ZIPを生成しました",
-        extra={"session_id": str(session_id)},
+        extra={"session_id": str(session_id), "output_format": output_format},
     )
 
     filename = f"{submission.project_name}.zip"
