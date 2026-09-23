@@ -17,10 +17,11 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session as DBSession
@@ -28,16 +29,25 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.exceptions import (
     ClaudeJSONValidationError,
+    EmailAlreadyRegisteredError,
+    InvalidCredentialsError,
     InvalidStateTransitionError,
     OllamaConnectionError,
     OllamaModelNotFoundError,
 )
 from app.core.logging import get_logger, setup_logging
+from app.core.security import (
+    TokenError,
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    verify_password,
+)
 from app.models import (
-    Base,
     Message,
     MessageRole,
     Project,
+    User,
 )
 from app.models import Session as SessionModel
 from app.models import SessionState, is_valid_transition
@@ -50,6 +60,10 @@ from app.schemas import (
     ProjectCreateRequest,
     ProjectCreateResponse,
     ProjectListItem,
+    TokenResponse,
+    UserLoginRequest,
+    UserRegisterRequest,
+    UserRegisterResponse,
     strip_json_fence,
 )
 from app.services.ai_agents import build_claude_handoff_prompt, run_hearing_turn
@@ -67,8 +81,11 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 開発用途のリーンな構成のため、Alembic等は使わずcreate_allでテーブルを用意する。
-    Base.metadata.create_all(bind=engine)
+    # フェーズA0でAlembicを導入して以降、スキーマ管理はAlembicのマイグレーション
+    # （`alembic upgrade head`）に一本化する。ここでcreate_allを残すと、コンテナ
+    # 再起動のたびにマイグレーション未適用のテーブルが先に作られてしまい、
+    # 「実際にどの変更がマイグレーション経由で適用されたか」が分からなくなるため、
+    # 起動時のcreate_all呼び出しは廃止した。
     logger.info("ArchitectAI backend起動完了")
     yield
 
@@ -91,6 +108,45 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# 認証（フェーズA2）: 全エンドポイントでJWT認証を必須とする。
+# auto_error=Falseとし、Authorizationヘッダ欠落時もFastAPI標準の403ではなく
+# 401（未認証）で統一する。
+# ---------------------------------------------------------------------------
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _get_user_by_id_sync(db: DBSession, user_id: uuid.UUID) -> Optional[User]:
+    return db.get(User, user_id)
+
+
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
+    db: DBSession = Depends(get_db),
+) -> User:
+    """Authorization: Bearer <JWT> を検証し、対応するユーザーを返す。
+
+    トークン欠落・無効・期限切れ・対応ユーザー不在のいずれも401とする
+    （どのケースかを区別して返すと情報漏洩になり得るため統一する）。
+    """
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="認証が必要です。")
+
+    try:
+        user_id = decode_access_token(credentials.credentials)
+    except TokenError as exc:
+        raise HTTPException(
+            status_code=401, detail="トークンが無効、または有効期限が切れています。"
+        ) from exc
+
+    user = await run_in_threadpool(_get_user_by_id_sync, db, uuid.UUID(user_id))
+    if user is None:
+        raise HTTPException(status_code=401, detail="トークンに対応するユーザーが見つかりません。")
+
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +191,28 @@ async def handle_claude_json_validation_error(
     )
 
 
+@app.exception_handler(EmailAlreadyRegisteredError)
+async def handle_email_already_registered_error(
+    request: Request, exc: EmailAlreadyRegisteredError
+) -> JSONResponse:
+    logger.warning("メールアドレス重複エラー (409)", extra={"path": str(request.url)})
+    return JSONResponse(
+        status_code=409,
+        content={"error": "email_already_registered", "message": exc.message},
+    )
+
+
+@app.exception_handler(InvalidCredentialsError)
+async def handle_invalid_credentials_error(
+    request: Request, exc: InvalidCredentialsError
+) -> JSONResponse:
+    logger.warning("認証失敗エラー (401)", extra={"path": str(request.url)})
+    return JSONResponse(
+        status_code=401,
+        content={"error": "invalid_credentials", "message": exc.message},
+    )
+
+
 @app.exception_handler(InvalidStateTransitionError)
 async def handle_invalid_state_transition_error(
     request: Request, exc: InvalidStateTransitionError
@@ -159,8 +237,42 @@ async def handle_invalid_state_transition_error(
 # ---------------------------------------------------------------------------
 
 
-def _get_session_sync(db: DBSession, session_id: uuid.UUID) -> SessionModel:
-    session = db.get(SessionModel, session_id)
+def _get_user_by_email_sync(db: DBSession, email: str) -> Optional[User]:
+    stmt = select(User).where(User.email == email)
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def _create_user_sync(db: DBSession, email: str, password: str) -> User:
+    if _get_user_by_email_sync(db, email) is not None:
+        raise EmailAlreadyRegisteredError(email)
+
+    user = User(email=email, hashed_password=hash_password(password))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def _authenticate_user_sync(db: DBSession, email: str, password: str) -> User:
+    user = _get_user_by_email_sync(db, email)
+    if user is None or not verify_password(password, user.hashed_password):
+        raise InvalidCredentialsError()
+    return user
+
+
+def _get_session_sync(db: DBSession, session_id: uuid.UUID, user_id: uuid.UUID) -> SessionModel:
+    """指定ユーザー自身のプロジェクトに属するセッションのみを取得する。
+
+    他ユーザーのセッション（存在はするが所有者が違う）へのアクセスも、
+    存在しないセッションへのアクセスも、区別せず同じ404として扱う
+    （他ユーザーのプロジェクトの存在有無を推測させないための設計判断）。
+    """
+    stmt = (
+        select(SessionModel)
+        .join(Project, Project.id == SessionModel.project_id)
+        .where(SessionModel.id == session_id, Project.user_id == user_id)
+    )
+    session = db.execute(stmt).scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail=f"session '{session_id}' が見つかりません。")
     return session
@@ -199,8 +311,10 @@ def _get_latest_message_by_role_sync(
 
 def _list_projects_sync(
     db: DBSession,
+    user_id: uuid.UUID,
 ) -> list[tuple[Project, SessionModel, Optional[str], Optional[str]]]:
-    """プロジェクト一覧を、各プロジェクトの最新セッションと合わせて取得する。
+    """ログイン中ユーザー自身のプロジェクト一覧を、各プロジェクトの最新セッションと
+    合わせて取得する（他ユーザーのプロジェクトは含めない）。
 
     現行仕様では1プロジェクトにつき常にセッションが1件（作成時に自動生成）
     しか存在しないが、将来の複数セッション化を見越して「最新のupdated_at」の
@@ -233,6 +347,7 @@ def _list_projects_sync(
             (SessionModel.project_id == latest_session_subq.c.project_id)
             & (SessionModel.updated_at == latest_session_subq.c.max_updated_at),
         )
+        .where(Project.user_id == user_id)
         .order_by(SessionModel.updated_at.desc())
     )
     rows = db.execute(stmt).all()
@@ -268,9 +383,11 @@ def _list_projects_sync(
     return results
 
 
-def _create_project_and_session_sync(db: DBSession, title: str) -> tuple[Project, SessionModel]:
+def _create_project_and_session_sync(
+    db: DBSession, title: str, user_id: uuid.UUID
+) -> tuple[Project, SessionModel]:
     """projectsを1件作成し、続けて紐づくsessionsを1件（current_state=HEARING）自動作成する。"""
-    project = Project(title=title)
+    project = Project(title=title, user_id=user_id)
     db.add(project)
     db.flush()  # session作成前にproject.idを確定させる
 
@@ -282,14 +399,21 @@ def _create_project_and_session_sync(db: DBSession, title: str) -> tuple[Project
     return project, session
 
 
-def _get_project_sync(db: DBSession, project_id: uuid.UUID) -> Project:
-    project = db.get(Project, project_id)
+def _get_project_sync(db: DBSession, project_id: uuid.UUID, user_id: uuid.UUID) -> Project:
+    """指定ユーザー自身が所有するプロジェクトのみを取得する。
+
+    他ユーザーのプロジェクト（存在するが所有者が違う）へのアクセスも、
+    存在しないプロジェクトへのアクセスも、区別せず同じ404として扱う
+    （他ユーザーのプロジェクトの存在有無を推測させないための設計判断）。
+    """
+    stmt = select(Project).where(Project.id == project_id, Project.user_id == user_id)
+    project = db.execute(stmt).scalar_one_or_none()
     if project is None:
         raise HTTPException(status_code=404, detail=f"project '{project_id}' が見つかりません。")
     return project
 
 
-def _delete_project_sync(db: DBSession, project_id: uuid.UUID) -> None:
+def _delete_project_sync(db: DBSession, project_id: uuid.UUID, user_id: uuid.UUID) -> None:
     """プロジェクトと、紐づくsessions・messagesを削除する。
 
     models.pyのDB外部キー自体には ondelete="CASCADE" は設定されていない
@@ -298,7 +422,7 @@ def _delete_project_sync(db: DBSession, project_id: uuid.UUID) -> None:
     呼ぶことで、SQLAlchemyがmessages -> sessions -> projectsの順に
     個別のDELETE文を発行する（DBのON DELETE句には依存しない）。
     """
-    project = _get_project_sync(db, project_id)
+    project = _get_project_sync(db, project_id, user_id)
     db.delete(project)
     db.commit()
 
@@ -308,20 +432,60 @@ def _delete_project_sync(db: DBSession, project_id: uuid.UUID) -> None:
 # ---------------------------------------------------------------------------
 
 
+@app.post("/api/v1/auth/register", response_model=UserRegisterResponse, status_code=201)
+async def register(
+    body: UserRegisterRequest,
+    db: DBSession = Depends(get_db),
+) -> UserRegisterResponse:
+    """新規ユーザー登録エンドポイント。登録のみを行い、トークンは発行しない
+    （ログインは別途 /api/v1/auth/login を呼び出す）。パスワードリセット・
+    メール確認機能は今回のスコープ外。"""
+    logger.info("auth/registerリクエストを受信しました", extra={"email": body.email})
+
+    user = await run_in_threadpool(_create_user_sync, db, body.email, body.password)
+
+    logger.info("ユーザーを登録しました", extra={"user_id": str(user.id)})
+
+    return UserRegisterResponse(user_id=str(user.id), email=user.email)
+
+
+@app.post("/api/v1/auth/login", response_model=TokenResponse)
+async def login(
+    body: UserLoginRequest,
+    db: DBSession = Depends(get_db),
+) -> TokenResponse:
+    """ログインエンドポイント。認証成功時、有効期限24時間のJWTを発行する。"""
+    logger.info("auth/loginリクエストを受信しました", extra={"email": body.email})
+
+    user = await run_in_threadpool(_authenticate_user_sync, db, body.email, body.password)
+    token, expires_at = create_access_token(str(user.id))
+
+    logger.info("ログインに成功しました", extra={"user_id": str(user.id)})
+
+    return TokenResponse(access_token=token, expires_at=expires_at)
+
+
 @app.post("/api/v1/projects", response_model=ProjectCreateResponse, status_code=201)
 async def create_project(
     body: ProjectCreateRequest,
     db: DBSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> ProjectCreateResponse:
     """プロジェクトを新規作成し、紐づくセッション（HEARING状態）を1件自動作成する。
 
     仕様書には明記されていなかったが、フロントエンドが画面を開いた直後に
     project_id / session_id をそのまま使って /chat を呼び出せるようにするための
-    起点エンドポイントとして追加した。
+    起点エンドポイントとして追加した。フェーズA2以降、作成したプロジェクトは
+    ログイン中のユーザーに紐づける。
     """
-    logger.info("projectsリクエストを受信しました", extra={"title": body.title})
+    logger.info(
+        "projectsリクエストを受信しました",
+        extra={"title": body.title, "user_id": str(current_user.id)},
+    )
 
-    project, session = await run_in_threadpool(_create_project_and_session_sync, db, body.title)
+    project, session = await run_in_threadpool(
+        _create_project_and_session_sync, db, body.title, current_user.id
+    )
 
     logger.info(
         "プロジェクト・セッションを作成しました",
@@ -337,15 +501,19 @@ async def create_project(
 
 
 @app.get("/api/v1/projects", response_model=list[ProjectListItem])
-async def list_projects(db: DBSession = Depends(get_db)) -> list[ProjectListItem]:
-    """プロジェクト一覧エンドポイント。各プロジェクトの最新セッション状態も併せて返す。
+async def list_projects(
+    db: DBSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[ProjectListItem]:
+    """プロジェクト一覧エンドポイント。ログイン中ユーザー自身のプロジェクトのみを
+    対象とし、各プロジェクトの最新セッション状態も併せて返す。
 
     フロントエンドはこの結果を使って、左パネルの一覧表示と、
     localStorageに保存されたsession_idの生存確認（状態復元）の両方を行う。
     """
-    logger.info("projects一覧リクエストを受信しました")
+    logger.info("projects一覧リクエストを受信しました", extra={"user_id": str(current_user.id)})
 
-    rows = await run_in_threadpool(_list_projects_sync, db)
+    rows = await run_in_threadpool(_list_projects_sync, db, current_user.id)
 
     return [
         ProjectListItem(
@@ -366,14 +534,16 @@ async def list_projects(db: DBSession = Depends(get_db)) -> list[ProjectListItem
 async def delete_project(
     project_id: uuid.UUID,
     db: DBSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> Response:
-    """プロジェクト削除エンドポイント。紐づくsessions・messagesも合わせて削除する。"""
+    """プロジェクト削除エンドポイント。紐づくsessions・messagesも合わせて削除する。
+    ログイン中ユーザー自身が所有するプロジェクトのみ削除できる。"""
     logger.info(
         "project削除リクエストを受信しました",
-        extra={"project_id": str(project_id)},
+        extra={"project_id": str(project_id), "user_id": str(current_user.id)},
     )
 
-    await run_in_threadpool(_delete_project_sync, db, project_id)
+    await run_in_threadpool(_delete_project_sync, db, project_id, current_user.id)
 
     logger.info(
         "プロジェクトを削除しました（紐づくsessions/messagesも削除）",
@@ -389,8 +559,10 @@ async def chat(
     body: ChatMessageRequest,
     request_proposal: bool = False,
     db: DBSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> ChatMessageResponse:
-    """要件定義ヒアリング・提案エンドポイント。
+    """要件定義ヒアリング・提案エンドポイント。ログイン中ユーザー自身のプロジェクトに
+    属するセッションのみ操作できる。
 
     request_proposal=False（既定）: 通常のヒアリング継続（HEARING状態でのみ許可）。
     request_proposal=True:
@@ -400,10 +572,10 @@ async def chat(
     """
     logger.info(
         "chatリクエストを受信しました",
-        extra={"session_id": str(session_id)},
+        extra={"session_id": str(session_id), "user_id": str(current_user.id)},
     )
 
-    session = await run_in_threadpool(_get_session_sync, db, session_id)
+    session = await run_in_threadpool(_get_session_sync, db, session_id, current_user.id)
     await run_in_threadpool(_persist_message_sync, db, session_id, MessageRole.USER, body.message)
 
     if request_proposal:
@@ -463,18 +635,20 @@ async def submit_claude_json(
     session_id: uuid.UUID,
     body: ClaudeRawSubmission,
     db: DBSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> ClaudeSubmissionResponse:
-    """Claude Web出力の受信・検証エンドポイント。
+    """Claude Web出力の受信・検証エンドポイント。ログイン中ユーザー自身のプロジェクトに
+    属するセッションのみ操作できる。
 
     ```json フェンスの除去 -> JSONパース -> Pydanticバリデーションの順に処理し、
     いずれかに失敗した場合は具体的な異常箇所を含む ClaudeJSONValidationError を送出する。
     """
     logger.info(
         "submit_claude_jsonリクエストを受信しました",
-        extra={"session_id": str(session_id)},
+        extra={"session_id": str(session_id), "user_id": str(current_user.id)},
     )
 
-    session = await run_in_threadpool(_get_session_sync, db, session_id)
+    session = await run_in_threadpool(_get_session_sync, db, session_id, current_user.id)
 
     if session.current_state != SessionState.CLAUDE_REVIEW:
         raise InvalidStateTransitionError(session.current_state.value, SessionState.COMPLETED.value)
@@ -530,8 +704,10 @@ async def edit_claude_json(
     session_id: uuid.UUID,
     body: ClaudeRawSubmission,
     db: DBSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> ClaudeSubmissionResponse:
     """確定済みJSONの直接編集・再生成エンドポイント（仕様書 Step2）。
+    ログイン中ユーザー自身のプロジェクトに属するセッションのみ操作できる。
 
     Claude Web等によるレビュー（Human-in-the-Loop）を意図的にバイパスし、
     ユーザーが確定済みJSONを直接書き換えられるようにする設計判断であり、
@@ -547,10 +723,10 @@ async def edit_claude_json(
     """
     logger.info(
         "edit_claude_jsonリクエストを受信しました",
-        extra={"session_id": str(session_id)},
+        extra={"session_id": str(session_id), "user_id": str(current_user.id)},
     )
 
-    session = await run_in_threadpool(_get_session_sync, db, session_id)
+    session = await run_in_threadpool(_get_session_sync, db, session_id, current_user.id)
 
     if session.current_state != SessionState.COMPLETED:
         raise InvalidStateTransitionError(session.current_state.value, SessionState.COMPLETED.value)
@@ -599,14 +775,19 @@ async def edit_claude_json(
 
 
 @app.get("/api/v1/sessions/{session_id}/export")
-async def export(session_id: uuid.UUID, db: DBSession = Depends(get_db)) -> Response:
-    """確定した構成のZIPダウンロードエンドポイント。"""
+async def export(
+    session_id: uuid.UUID,
+    db: DBSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Response:
+    """確定した構成のZIPダウンロードエンドポイント。ログイン中ユーザー自身の
+    プロジェクトに属するセッションのみダウンロードできる。"""
     logger.info(
         "exportリクエストを受信しました",
-        extra={"session_id": str(session_id)},
+        extra={"session_id": str(session_id), "user_id": str(current_user.id)},
     )
 
-    session = await run_in_threadpool(_get_session_sync, db, session_id)
+    session = await run_in_threadpool(_get_session_sync, db, session_id, current_user.id)
 
     if session.current_state != SessionState.COMPLETED:
         raise HTTPException(

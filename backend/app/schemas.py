@@ -9,10 +9,26 @@ import re
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 # サービス名はYAML特殊文字混入を防ぐため英数字・ハイフン・アンダースコアのみ許可する。
 _SERVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# bcryptアルゴリズム自体の仕様上の制約（core/security.py参照）。これを超える
+# パスワードをbcryptにそのまま渡すとValueErrorで落ちるため、リクエスト受信時点
+# （register/loginとも）で明示的に弾く。
+_BCRYPT_MAX_PASSWORD_BYTES = 72
+
+
+def _validate_password_byte_length(value: str) -> str:
+    byte_length = len(value.encode("utf-8"))
+    if byte_length > _BCRYPT_MAX_PASSWORD_BYTES:
+        raise ValueError(
+            f"パスワードが長すぎます（{byte_length}バイト）。"
+            f"{_BCRYPT_MAX_PASSWORD_BYTES}バイト以内にしてください"
+            "（日本語等のマルチバイト文字は1文字が複数バイトになる点に注意してください）。"
+        )
+    return value
 
 # ```json ... ``` / ``` ... ``` のようなMarkdownコードフェンスを除去するための正規表現。
 _JSON_FENCE_PATTERN = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -88,6 +104,46 @@ class ClaudeSubmissionResponse(BaseModel):
 
     status: str = Field(default="ok")
     current_state: str
+
+
+class UserRegisterRequest(BaseModel):
+    """新規登録エンドポイント（POST /api/v1/auth/register）への入力。"""
+
+    email: EmailStr = Field(..., description="ログインに使用するメールアドレス")
+    password: str = Field(..., min_length=8, description="パスワード（8文字以上、72バイト以内）")
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_length(cls, value: str) -> str:
+        return _validate_password_byte_length(value)
+
+
+class UserRegisterResponse(BaseModel):
+    """新規登録エンドポイントの応答。登録のみ行い、ログインは別途行う想定のため
+    トークンは発行しない。"""
+
+    user_id: str = Field(..., description="作成されたユーザーのID")
+    email: str
+
+
+class UserLoginRequest(BaseModel):
+    """ログインエンドポイント（POST /api/v1/auth/login）への入力。"""
+
+    email: EmailStr = Field(..., description="登録済みのメールアドレス")
+    password: str = Field(..., min_length=1, description="パスワード")
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_length(cls, value: str) -> str:
+        return _validate_password_byte_length(value)
+
+
+class TokenResponse(BaseModel):
+    """ログインエンドポイントの応答（JWTアクセストークン）。"""
+
+    access_token: str = Field(..., description="JWTアクセストークン")
+    token_type: str = Field(default="bearer")
+    expires_at: datetime = Field(..., description="トークンの有効期限（UTC）")
 
 
 class ProjectCreateRequest(BaseModel):

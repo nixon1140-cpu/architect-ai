@@ -29,6 +29,7 @@ services:
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       # ホストのOllamaに実際に取得済みのタグへ変更（Web版Claude承認済み。Step1固定内容からの変更）。
       OLLAMA_MODEL: gemma4:e4b-it-q4_K_M
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
     depends_on:
       db:
         condition: service_healthy
@@ -40,6 +41,8 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./backend/app:/app/app
+      - ./backend/alembic.ini:/app/alembic.ini
+      - ./backend/alembic:/app/alembic
 
   frontend:
     build:

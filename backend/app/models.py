@@ -52,11 +52,24 @@ def is_valid_transition(current: SessionState, target: SessionState) -> bool:
     return target in ALLOWED_STATE_TRANSITIONS.get(current, set())
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    hashed_password: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
 class Project(Base):
     __tablename__ = "projects"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     title: Mapped[str] = mapped_column(String, nullable=False)
+    # フェーズA2：2段階マイグレーションの第2段階でNOT NULLへ変更済み
+    # （第1段階でnullable追加後、既存レコード0件・user_id未設定レコード0件を
+    # 確認してからNOT NULL制約を適用した）。
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
     sessions: Mapped[list["Session"]] = relationship(

@@ -1,6 +1,15 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+
+import {
+  apiRequest,
+  apiRequestBlob,
+  clearAuthToken,
+  loadAuthToken,
+} from "@/lib/api";
+import { useToast, ToastViewport } from "@/lib/toast";
 
 // ---------------------------------------------------------------------------
 // 型定義（backend/app/schemas.py に対応）
@@ -40,94 +49,6 @@ interface ProjectListItem {
   updated_at: string;
   claude_handoff_prompt: string | null;
   claude_json_content: string | null;
-}
-
-// ---------------------------------------------------------------------------
-// API通信ヘルパー
-// ---------------------------------------------------------------------------
-
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-
-class ApiError extends Error {
-  status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
-// バックエンドは大きく2種類のエラー形状を返す:
-//  1) core/exceptions.py のカスタム例外 -> {"error": "...", "message": "...", ...}
-//  2) FastAPI標準のHTTPException/バリデーションエラー -> {"detail": "..." または [{loc, msg, type}, ...]}
-function extractErrorMessage(body: unknown): string {
-  if (body && typeof body === "object") {
-    const obj = body as Record<string, unknown>;
-
-    if (typeof obj.message === "string") {
-      // ClaudeJSONValidationErrorはerrors配列に詳細な異常箇所を含む。
-      if (Array.isArray(obj.errors) && obj.errors.length > 0) {
-        const details = obj.errors
-          .map((e) => {
-            if (e && typeof e === "object") {
-              const err = e as Record<string, unknown>;
-              const loc = Array.isArray(err.loc) ? err.loc.join(".") : "";
-              return `${loc}: ${String(err.msg ?? "")}`;
-            }
-            return String(e);
-          })
-          .join(" / ");
-        return `${obj.message} (${details})`;
-      }
-      return obj.message;
-    }
-
-    if (typeof obj.detail === "string") {
-      return obj.detail;
-    }
-
-    if (Array.isArray(obj.detail)) {
-      return obj.detail
-        .map((e) => {
-          if (e && typeof e === "object") {
-            const err = e as Record<string, unknown>;
-            const loc = Array.isArray(err.loc) ? err.loc.join(".") : "";
-            return `${loc}: ${String(err.msg ?? "")}`;
-          }
-          return String(e);
-        })
-        .join(" / ");
-    }
-  }
-  return "予期しないエラーが発生しました。";
-}
-
-async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE_URL}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(options?.headers ?? {}),
-    },
-  });
-
-  if (!res.ok) {
-    let body: unknown = null;
-    try {
-      body = await res.json();
-    } catch {
-      // 応答がJSONでない場合は無視してデフォルトメッセージを使う。
-    }
-    throw new ApiError(res.status, extractErrorMessage(body));
-  }
-
-  // 204 No Content（削除系エンドポイント等）はボディを持たないため、
-  // res.json() を呼ばずに終える。既存のJSONを返すエンドポイントの
-  // 挙動には影響しない。
-  if (res.status === 204) {
-    return undefined as T;
-  }
-
-  return (await res.json()) as T;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,39 +96,6 @@ function loadActiveSession(): StoredActiveSession | null {
   } catch {
     return null;
   }
-}
-
-// ---------------------------------------------------------------------------
-// トースト（エラー等をコンソールへ握りつぶさず画面上に表示する）
-// ---------------------------------------------------------------------------
-
-interface ToastState {
-  kind: "error" | "info";
-  text: string;
-}
-
-function useToast() {
-  const [toast, setToast] = useState<ToastState | null>(null);
-
-  useEffect(() => {
-    if (!toast) return;
-    const timer = setTimeout(() => setToast(null), 8000);
-    return () => clearTimeout(timer);
-  }, [toast]);
-
-  const showError = (err: unknown) => {
-    const text =
-      err instanceof ApiError
-        ? `[HTTP ${err.status}] ${err.message}`
-        : err instanceof Error
-          ? err.message
-          : "予期しないエラーが発生しました。";
-    setToast({ kind: "error", text });
-  };
-
-  const showInfo = (text: string) => setToast({ kind: "info", text });
-
-  return { toast, showError, showInfo, dismiss: () => setToast(null) };
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +193,7 @@ function PipelineRail({ state }: { state: SessionState | null }) {
 // ---------------------------------------------------------------------------
 
 export default function Home() {
+  const router = useRouter();
   const { toast, showError, showInfo, dismiss } = useToast();
 
   // --- ハイドレーション対策: it-news-appのarticle-card.tsxと同じパターン。
@@ -383,9 +272,15 @@ export default function Home() {
     saveActiveSession(item.project_id, item.session_id);
   }
 
-  // --- マウント後、一覧取得と保存済みセッションの復元を行う ---------------------
+  // --- マウント後、未ログインならログイン画面へ、そうでなければ一覧取得と
+  // 保存済みセッションの復元を行う ---------------------------------------------
   useEffect(() => {
     setMounted(true);
+
+    if (!loadAuthToken()) {
+      router.push("/login");
+      return;
+    }
 
     (async () => {
       const list = await fetchProjects();
@@ -451,6 +346,13 @@ export default function Home() {
     setClaudeJsonEditText("");
     setProjectTitle("");
     clearActiveSession();
+  }
+
+  // --- ログアウト -------------------------------------------------------------
+  function handleLogout() {
+    clearAuthToken();
+    clearActiveSession();
+    router.push("/login");
   }
 
   // --- プロジェクト削除 -------------------------------------------------------
@@ -580,20 +482,9 @@ export default function Home() {
     if (!sessionId) return;
     setExporting(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/v1/sessions/${sessionId}/export`);
-      if (!res.ok) {
-        let body: unknown = null;
-        try {
-          body = await res.json();
-        } catch {
-          // ignore
-        }
-        throw new ApiError(res.status, extractErrorMessage(body));
-      }
-      const blob = await res.blob();
-      const disposition = res.headers.get("Content-Disposition") ?? "";
-      const match = /filename="?([^"]+)"?/.exec(disposition);
-      const filename = match ? match[1] : "architect-ai-output.zip";
+      const { blob, filename } = await apiRequestBlob(
+        `/api/v1/sessions/${sessionId}/export`
+      );
 
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -626,7 +517,16 @@ export default function Home() {
             system design console
           </span>
         </div>
-        <PipelineRail state={currentState} />
+        <div className="flex items-center gap-4">
+          <PipelineRail state={currentState} />
+          <button
+            type="button"
+            className="rounded-sm border border-rule-strong px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-muted transition-colors hover:border-accent-dim hover:text-accent"
+            onClick={handleLogout}
+          >
+            ログアウト
+          </button>
+        </div>
       </header>
 
       <div className="flex flex-1 flex-col lg:min-h-0 lg:flex-row lg:overflow-hidden">
@@ -939,36 +839,7 @@ export default function Home() {
       </div>
 
       {/* トースト（エラー等は必ずここに表示する。コンソールへの握りつぶしは行わない） */}
-      {toast && (
-        <div
-          className={`toast-enter fixed bottom-5 right-5 z-50 max-w-sm rounded-sm border-l-2 bg-panel px-4 py-3 shadow-2xl shadow-black/60 ${
-            toast.kind === "error" ? "border-danger" : "border-accent"
-          }`}
-          role="alert"
-        >
-          <div className="flex items-start gap-3">
-            <div className="flex flex-1 flex-col gap-1">
-              <span
-                className={`font-mono text-[10px] uppercase tracking-[0.18em] ${
-                  toast.kind === "error" ? "text-danger" : "text-accent"
-                }`}
-              >
-                {toast.kind === "error" ? "error" : "info"}
-              </span>
-              <span className="text-[13px] leading-relaxed text-ink">
-                {toast.text}
-              </span>
-            </div>
-            <button
-              className="rounded-sm px-1 text-[12px] text-muted transition-colors hover:text-ink"
-              onClick={dismiss}
-              aria-label="通知を閉じる"
-            >
-              ✕
-            </button>
-          </div>
-        </div>
-      )}
+      <ToastViewport toast={toast} onDismiss={dismiss} />
     </div>
   );
 }

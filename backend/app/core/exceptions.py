@@ -37,6 +37,24 @@ class InvalidStateTransitionError(ArchitectAIError):
         super().__init__(f"'{current_state}' から '{target_state}' への状態遷移は許可されていません。")
 
 
+class EmailAlreadyRegisteredError(ArchitectAIError):
+    """新規登録時、指定されたメールアドレスが既に登録済みだった場合に送出する。"""
+
+    def __init__(self, email: str):
+        self.email = email
+        super().__init__(f"メールアドレス '{email}' は既に登録されています。")
+
+
+class InvalidCredentialsError(ArchitectAIError):
+    """ログイン時、メールアドレスまたはパスワードが一致しなかった場合に送出する。
+
+    どちらが不正かをメッセージで区別しない（アカウント存在有無の推測を防ぐため）。
+    """
+
+    def __init__(self) -> None:
+        super().__init__("メールアドレスまたはパスワードが正しくありません。")
+
+
 class ClaudeJSONValidationError(ArchitectAIError):
     """Claude Web出力JSONのバリデーションに失敗した場合に送出する。
 
