@@ -97,7 +97,9 @@ ZIPをダウンロードできます。
 | データベース | PostgreSQL 16 (Docker) |
 | ヒアリング・構成案AI | ローカルLLM: Ollama (`gemma4:e4b-it-q4_K_M`) |
 | 最終レビューAI | Claude Web（Human-in-the-Loop、貼り付け方式） |
-| IaC生成 | Jinja2テンプレート → メモリ上でZIP化 |
+| 認証 | JWT（PyJWT）+ bcrypt（パスワードハッシュ化） |
+| DBマイグレーション | Alembic |
+| IaC生成 | Jinja2テンプレート → メモリ上でZIP化（Docker Compose / Terraform〈HCLテンプレート〉の2形式） |
 | インフラ | Docker Compose（`db` / `backend` / `frontend`の3コンテナ） |
 
 役割ベースで整理すると、**日常的なヒアリング・構成案作成はローカルAIに
@@ -242,12 +244,20 @@ cd architect-ai
 copy .env.example .env
 ```
 
-`.env`には以下の3項目を設定します。
+`.env`には以下の4項目を設定します。
 
 ```
 POSTGRES_USER=architect
 POSTGRES_PASSWORD=architect
 POSTGRES_DB=architectai
+JWT_SECRET_KEY=<ランダムな文字列>
+```
+
+`JWT_SECRET_KEY`はJWTの署名鍵です。プレースホルダーのまま使わず、
+以下のように生成した値に置き換えてください。
+
+```powershell
+python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
 ### 起動手順
@@ -258,6 +268,18 @@ docker compose up --build
 
 - Frontend: http://localhost:4500
 - Backend API: http://localhost:8000/docs
+
+起動後、DBスキーマはAlembicのマイグレーションで管理しています
+（コンテナ起動時に自動適用はされないため、初回起動時と
+マイグレーション追加時は手動で以下を実行してください）。
+
+```powershell
+docker exec architectai-backend alembic upgrade head
+```
+
+すべてのAPIはJWT認証が必須です。初回はフロントエンド
+（http://localhost:4500）の新規登録画面からアカウントを作成し、
+ログインしてから利用してください。
 
 ### 停止
 
