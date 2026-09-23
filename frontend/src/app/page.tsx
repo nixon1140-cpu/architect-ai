@@ -234,6 +234,9 @@ export default function Home() {
 
   // --- ZIPダウンロード状態 ----------------------------------------------------
   const [exporting, setExporting] = useState(false);
+  const [exportFormat, setExportFormat] = useState<"docker-compose" | "terraform">(
+    "docker-compose"
+  );
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -483,7 +486,7 @@ export default function Home() {
     setExporting(true);
     try {
       const { blob, filename } = await apiRequestBlob(
-        `/api/v1/sessions/${sessionId}/export`
+        `/api/v1/sessions/${sessionId}/export?output_format=${exportFormat}`
       );
 
       const url = URL.createObjectURL(blob);
@@ -807,6 +810,36 @@ export default function Home() {
                 構成が確定しました。初期インフラコード一式をZIPでダウンロードできます。
                 内容を直接編集して再生成することもできます。
               </p>
+
+              <div className="flex flex-col gap-2">
+                <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted">
+                  出力形式
+                </span>
+                <div className="flex gap-4">
+                  {(
+                    [
+                      { value: "docker-compose", label: "Docker Compose" },
+                      { value: "terraform", label: "Terraform" },
+                    ] as const
+                  ).map((option) => (
+                    <label
+                      key={option.value}
+                      className="flex cursor-pointer items-center gap-1.5 text-[13px] text-ink"
+                    >
+                      <input
+                        type="radio"
+                        name="export-format"
+                        value={option.value}
+                        checked={exportFormat === option.value}
+                        onChange={() => setExportFormat(option.value)}
+                        className="accent-accent"
+                      />
+                      {option.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+
               <button
                 className="flex items-center justify-center gap-2 rounded-sm border border-ok/50 bg-ok/10 px-3 py-2 text-[13px] font-semibold text-ok transition-colors hover:bg-ok/20 disabled:opacity-40"
                 disabled={exporting}
