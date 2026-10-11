@@ -1,4 +1,4 @@
-# ArchitectAI 作業進捗（2026-10-05 時点）
+# ArchitectAI 作業進捗（2026-10-11 時点）
 
 新しいセッションで続きから再開するためのメモ。秘密の値は書かない。
 
@@ -23,7 +23,9 @@
 3. 「管理者のローカル自動ログイン」は作らない方針（外部公開すると誰でも管理者になれる危険があるため）
 4. フロントの Docker イメージは本番ビルド方式（`app/` のバインドマウントなし）。コード変更のたびに `docker compose build frontend` が必要
 5. 将来機能: 過去プロジェクトの曖昧検索（DB変更あり。実装前に方針の相談が必要）、複数セッション、Claude API直結
-6. このリポジトリの `.claude/` 配下は未追跡のまま。it-news-app で `.claude/settings.local.json` に秘密のキーが入って公開された事故があったため、**追跡しないこと**
+6. CORS（別サイトからのアクセス許可）は `http://localhost:4500` だけ（`backend/app/main.py`）。Cloudflare Tunnel の公開アドレスには未対応。外部公開するなら許可先の追加が必要
+7. 追加済み: CLAUDE.md、docs/spec.md、`.git/hooks/pre-commit`（`.env` の commit を止める。git管理外なので新しいPCでは入れ直しが必要）。試験結果（一時フォルダの偽リポジトリで確認、後で削除）: `.env` を含む commit は止まった、`.env.example` のみの commit は通った
+8. このリポジトリの `.claude/` 配下は未追跡のまま。it-news-app で `.claude/settings.local.json` に秘密のキーが入って公開された事故があったため、**追跡しないこと**
 
 ## 次にやること
 1. ヒアリング〜構成案〜確定の一連を実機確認（Ollama は修復済み。遅さに注意）
