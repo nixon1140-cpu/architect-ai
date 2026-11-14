@@ -28,4 +28,11 @@
 `project_name`、`services[]`（`name`・`type`・`image_or_build`・`env`・`ports`）、`notes`。`services[].name` は英数字・`-`・`_` のみ。
 
 ## 未実装（意図的）
-パスワードリセット、メール確認、新規登録の制限。外部公開するなら招待制・レート制限が必要。
+パスワードリセット、メール確認、新規登録の制限。常時の外部公開はしないため、招待制・レート制限は当面不要。常時公開に変える場合は必要。
+
+## 公開と起動の方法（2026-11-15決定）
+- 公開：ふだんは Tailscale Funnel（インターネット公開の機能）を止めておく。実物を見せるときだけ手で公開し（443 → 4500、URL は `https://architect-ai.taild15be6.ts.net/` のみを使う）、見せ終わったら止める。
+- スマホなど他の端末からの閲覧（Tailscale Serve）は行わない。
+- いつでも見られる見せ方は、README の画面画像で行う。
+- 起動：今は IT News Navigator（別リポジトリ）の start-app.bat から一緒に起動されている。これを単独で起動する形にする（作業は別の Issue で行う）。
+- CORS：実物を見せる前に、CORS の許可先に `https://architect-ai.taild15be6.ts.net` を追加する（作業は別の Issue で行う）。
